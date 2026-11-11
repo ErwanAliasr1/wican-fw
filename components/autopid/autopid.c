@@ -60,6 +60,7 @@
 #define TEMP_BUFFER_LENGTH 32
 #define ECU_CONNECTED_BIT BIT0
 #define AUTOPID_POLL_JITTER_MS 100
+#define AUTOPID_KLINE_MAX_FAILURES 3
 
 // Backoff tuning (milliseconds)
 // How many consecutive failures before enabling backoff.
@@ -3846,6 +3847,7 @@ static void autopid_task(void *pvParameters)
     {
         static pid_type_t previous_pid_type = PID_MAX;
         static bool pid_polling_paused_prev = false;
+        static uint8_t kline_failures = 0;
 
         dev_status_wait_for_bits(DEV_AUTOPID_ELM327_APP_BIT, portMAX_DELAY);
         
@@ -4133,6 +4135,27 @@ static void autopid_task(void *pvParameters)
                         else
                         {
                             ESP_LOGE(TAG, "Failed to process command: %s", curr_pid->cmd);
+                        }
+                        // K-line: an ECU that restarts (e.g. while cranking) drops the
+                        // session, but the ELM chip keeps it open and never runs a new
+                        // slow init, so every later request fails. Close the protocol
+                        // after a few failures in a row to force a fresh init.
+                        {
+                            int32_t proto = 0;
+                            if (!param->failed)
+                            {
+                                kline_failures = 0;
+                            }
+                            else if (autopid_get_protocol_number(&proto) == ESP_OK &&
+                                     autopid_kline_protocol(proto) &&
+                                     ++kline_failures >= AUTOPID_KLINE_MAX_FAILURES)
+                            {
+                                ESP_LOGW(TAG, "K-line: %d failures in a row, closing protocol (ATPC) to force a new init",
+                                         AUTOPID_KLINE_MAX_FAILURES);
+                                send_commands("ATPC\r", 2);
+                                previous_pid_type = PID_MAX; // resend the init with the next request
+                                kline_failures = 0;
+                            }
                         }
                         // Update pid data
                         autopid_data_update(autopid_config);
